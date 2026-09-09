@@ -1,0 +1,146 @@
+# =============================================================================
+# VitalsChair — APP STACK (3 containers)   Verdin iMX8MP / TorizonCore
+#
+# Deploy target on the board:
+#   /var/sota/storage/docker-compose/docker-compose.yml   (+ its .env alongside)
+# Placing it there lets TorizonCore's docker-compose.service start it on boot.
+#
+# Tailscale is intentionally NOT here — it lives in ../tailscale so a `down`
+# of this stack can never cut your remote access (the lifeline stays up).
+#
+# Faithful translation of the hand-typed `docker run` commands, with the
+# WiFi/nmcli D-Bus fix folded into vitaldata.
+# =============================================================================
+services:
+  # ── Backend (.NET) ────────────────────────────────────────────────────────
+  vitaldata:
+    image: anuragbluai/vitalschair-prod-v1:${VITALDATA_TAG:-dev}
+    container_name: vitaldata
+    user: root
+    privileged: true
+    restart: unless-stopped
+    networks:
+      crank-net:
+        aliases:
+          - vitaldata-backend        # crankgui reaches it via BACKEND_HOST=vitaldata-backend
+    ports:
+      - "5000:5000"
+      - "5003:5003"
+      - "2000:2000"
+      - "7777:7777"
+      - "9000:9000"
+      - "55555:55555"
+      - "65440:65440"
+    devices:
+      - /dev/gpiochip0
+      - /dev/verdin-uart1:/dev/verdin-uart1
+      - /dev/verdin-uart2:/dev/verdin-uart2
+      - /dev/snd:/dev/snd
+      - /dev/bus/usb:/dev/bus/usb
+    device_cgroup_rules:
+      - "c 207:* rmw"
+    volumes:
+      - /home/torizon/audio_shared:/app/audio
+      - /dev/bus/usb:/dev/bus/usb
+      - /dev/snd:/dev/snd
+      - /dev:/dev
+      - /mnt/shared_ipc:/mnt/shared_ipc
+      - vitalschair_data:/data          # persistent: registration, config cache,
+                                        # offline vitals queue, logs — survives updates
+      - /run/dbus:/run/dbus                                              # ← WiFi/nmcli fix
+      - /etc/localtime:/etc/localtime:ro                                 # follow host timezone
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket   # ← WiFi/nmcli fix
+      - APP_VERSION=${VITALDATA_TAG:-dev}   # image tag → audit BOOT/UPDATE_DETECTED
+      # Optional app config (uncomment / set in .env as needed):
+      # - HL7_ENABLED=false
+      # - HL7_HIS_HOST=192.168.8.155
+      # - HL7_HIS_PORT=2575
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Weston compositor (display) ───────────────────────────────────────────
+  weston:
+    image: anuragbluai/weston-vitalschair:latest
+    container_name: weston
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - CAP_SYS_TTY_CONFIG
+    volumes:
+      - /dev:/dev
+      - /tmp:/tmp
+      - /run/udev/:/run/udev/
+    device_cgroup_rules:
+      - "c 4:* rmw"
+      - "c 13:* rmw"
+      - "c 199:* rmw"
+      - "c 226:* rmw"
+    environment:
+      - ACCEPT_FSL_EULA=1
+    command: ["--developer", "--tty=/dev/tty7"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /tmp/1000-runtime-dir/wayland-0"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  # ── Crank GUI (frontend) ──────────────────────────────────────────────────
+  # Stable service name; bump only the image tag on a new GUI release.
+  crankgui:
+    image: anuragbluai/crankgui_prod:Rev-08
+    container_name: crankgui
+    restart: always
+    networks:
+      - crank-net
+    ipc: host
+    volumes:
+      - /dev:/dev
+      - /tmp:/tmp
+      - /run/udev:/run/udev:ro
+      - /dev/shm:/dev/shm
+      - /etc/localtime:/etc/localtime:ro      # follow host timezone (GUI shows local time)
+      - /etc/timezone:/etc/timezone:ro
+    devices:
+      - /dev/dri
+      - /dev/galcore
+    environment:
+      - WAYLAND_DISPLAY=wayland-0
+      - BACKEND_HOST=vitaldata-backend
+      - BACKEND_PORT=5003
+      - RECONNECT_RETRY=10
+      - RECONNECT_DELAY=2
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    mem_limit: 768m
+    memswap_limit: 1g
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'sbengine|greio-server|crank' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  vitalschair_data:
+
+networks:
+  # The existing bridge the running containers already use. Declared external
+  # so compose attaches to it instead of creating a new "<project>_crank-net".
+  # If it ever doesn't exist:  docker network create torizon_crank-net
+  crank-net:
+    external: true
+    name: torizon_crank-net

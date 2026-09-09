@@ -1,0 +1,88 @@
+version: "3.9"
+services:
+  crank-tcp:
+    image: anuragbluai/crank-tcp:v2
+    networks:
+      - crank-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  vitalschair_prod_v1:
+    image: ${DOCKER_LOGIN}/vitalschair_prod_v1:${TAG}
+    container_name: vitaldata
+    pid: host
+    privileged: true
+    security_opt:
+      - no-new-privileges:false
+    cap_add:
+      - NET_ADMIN
+      - SYS_BOOT
+      - SYS_ADMIN
+      - SYS_PTRACE
+    ports:
+      - "5002:5000"
+      - "5004:5003"
+    environment:
+      - HL7_ENABLED=false
+      - HL7_HIS_HOST=192.168.8.155
+      - HL7_HIS_PORT=2575
+      - ApiSettings__BluHealthDeviceUrl=${BLU_DEVICE_URL}
+      - ApiSettings__BluHealthVitalsUrl=${BLU_VITALS_URL}
+      - ApiSettings__AzureOpenAiUrl=${AZURE_OPENAI_URL}
+      - ApiSettings__AzureApiKey=${AZURE_API_KEY}
+    devices:
+      - /dev/gpiochip0
+      - /dev/verdin-uart1:/dev/verdin-uart1
+      - /dev/verdin-uart2:/dev/verdin-uart2
+      - /dev/snd:/dev/snd
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      - ./audio:/app/audio:rw
+      - vitalschair_data:/data                        # ← THIS WAS MISSING
+      - /usr/bin/nmcli:/usr/bin/nmcli:ro
+      - /usr/lib/NetworkManager:/usr/lib/NetworkManager:ro
+      - /run/dbus:/run/dbus
+      - /run/systemd/system:/run/systemd/system:ro
+      - /var/run/dbus:/var/run/dbus
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+
+      
+        max-size: "5m"
+        max-file: "3"
+    networks:
+      - crank-net
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - tailscale_data:/var/lib/tailscale
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}                     # ← move to .env, not hardcoded
+      - TS_HOSTNAME=${TS_HOSTNAME}                   # ← per-board in .env
+      - TS_STATE_DIR=/var/lib/tailscale
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  vitalschair_data:
+  tailscale_data:
+
+networks:
+  crank-net:
+    driver: bridge

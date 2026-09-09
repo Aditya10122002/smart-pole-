@@ -1,0 +1,22 @@
+# Build artifacts
+bin/
+obj/
+
+# Torizon IDE files — not needed in Docker image
+.conf/
+.vscode/
+.gitlab-ci.yml
+.github/
+*.debug
+Dockerfile.debug
+docker-compose*.yml
+torizonPackages.json
+
+# OS / Editor
+.DS_Store
+*.user
+*.suo
+.idea/
+
+# Logs
+*.log

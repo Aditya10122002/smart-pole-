@@ -1,0 +1,32 @@
+# =============================================================================
+# VitalsChair — TAILSCALE LIFELINE (standalone)
+#
+# Kept separate from the app stack ON PURPOSE: this is your out-of-band remote
+# access. A `docker compose down` of the app stack can never touch it, so a bad
+# app deploy can't lock you out of the board.
+#
+# It is NOT managed by TorizonCore's boot service. It survives reboots via the
+# Docker restart policy (the daemon restarts `unless-stopped` containers on
+# boot) — exactly like your previous standalone `docker run`.
+#
+# Suggested location on the board:  /home/torizon/tailscale/
+# Start once:                        docker compose up -d
+# =============================================================================
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - tailscale_data:/var/lib/tailscale
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}        # from .env — NOT hardcoded
+      - TS_HOSTNAME=${TS_HOSTNAME}      # per-board, from .env
+      - TS_STATE_DIR=/var/lib/tailscale
+
+volumes:
+  tailscale_data:

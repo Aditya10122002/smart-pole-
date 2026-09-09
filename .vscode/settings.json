@@ -1,0 +1,36 @@
+{
+  "torizon_login": "torizon",
+  "torizon_psswd": "bluai",
+  "torizon_ip": "192.168.8.120",
+  "torizon_ssh_port": "22",
+
+  "host_ip": "192.168.8.107",
+
+  "torizon_workspace": "${workspaceFolder}",
+  "torizon_arch": "aarch64",
+  "torizon_gpu": "-imx8",
+
+  "torizon_debug_ssh_port": "2222",
+  "torizon_debug_port1": "5000",
+  "torizon_debug_port2": "5001",
+  "torizon_debug_port3": "5002",
+  "wait_sync": "1",
+  "torizon_run_as": "torizon",
+  "torizon_app_root": "/home/torizon/app",
+
+  "docker_tag": "v0.0.0",
+  "tcb.packageName": "vitalschair_prod_v1",
+  "tcb.version": "3.11.0",
+  "torizon.gpuPrefixRC": true,
+  "docker_login": "anuragbluai",
+  "docker_registry": "192.168.8.155:5002",
+  "docker_password": "dockerhub",
+  "host_arch": "amd64",
+  "containers.environment": {
+    "DOCKER_HOST": "tcp://192.168.8.120:2375",
+    "DEBUG_SSH_PORT": "2222",
+    "DEBUG_PORT1": "5000",
+    "DEBUG_PORT2": "5001",
+    "DEBUG_PORT3": "5002"
+  }
+}

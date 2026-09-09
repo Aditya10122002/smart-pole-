@@ -1,0 +1,24 @@
+bin
+obj
+
+credentials.zip
+*.lock.yml
+
+.conf/.depok
+.conf/.docok
+.conf/
+.gitlab-ci.yml
+Dockerfile.debug
+docker-compose.yml
+torizonPackages.json
+bin/
+obj/
+data/
+
+# Production secrets — never commit real .env (templates .env.example are fine)
+.env
+deploy/**/.env
+
+# ...but DO track the production compose files under deploy/ (overrides the
+# blanket "docker-compose.yml" ignore rule above).
+!deploy/**/docker-compose.yml
