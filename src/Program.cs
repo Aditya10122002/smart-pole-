@@ -997,6 +997,8 @@ public partial class VitalsChairApp
             _serialPortData.Open();
             _serialPortECG12.Open();
 
+            SendRequestPOST();   // tell the vitals module to start streaming (was only sent on GUI page-nav before; new GUI has no nav)
+
             await InitializeEcgSettingsAsync(_serialPortData, cts.Token);
 
             var serverTask = StartAllServersAsync();
