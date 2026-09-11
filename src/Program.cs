@@ -1633,7 +1633,7 @@ public partial class VitalsChairApp
                         _isAuthenticated = false;
                         
                         _currentState = MeasurementState.IDLE;
-                        _isLiveMode = false;
+                        _isLiveMode = true;
                         ResetStoredValues();
                         ClearAllMeasurementData();
                         _currentState = MeasurementState.HEIGHT_WEIGHT;
@@ -1688,7 +1688,7 @@ public partial class VitalsChairApp
                     lock (_lock)
                     {
                         _currentState = MeasurementState.IDLE;
-                        _isLiveMode = false;
+                        _isLiveMode = true;
                         ResetStoredValues();
                         ClearAllMeasurementData();
                         _currentState = MeasurementState.HEIGHT_WEIGHT;
