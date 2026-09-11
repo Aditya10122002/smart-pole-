@@ -1633,7 +1633,7 @@ public partial class VitalsChairApp
                         _isAuthenticated = false;
                         
                         _currentState = MeasurementState.IDLE;
-                        _isLiveMode = true;
+                        _isLiveMode = false;
                         ResetStoredValues();
                         ClearAllMeasurementData();
                         _currentState = MeasurementState.HEIGHT_WEIGHT;
@@ -1688,7 +1688,7 @@ public partial class VitalsChairApp
                     lock (_lock)
                     {
                         _currentState = MeasurementState.IDLE;
-                        _isLiveMode = true;
+                        _isLiveMode = false;
                         ResetStoredValues();
                         ClearAllMeasurementData();
                         _currentState = MeasurementState.HEIGHT_WEIGHT;
@@ -5175,6 +5175,10 @@ public partial class VitalsChairApp
                         }
                         break;
 
+                    case "UART_TEST":
+                        RunUartTest();
+                        break;
+
                     case "STATUS":
                         Log($"Current State: {_currentState}");
                         Log($"Live Mode: {_isLiveMode}");
@@ -5209,6 +5213,7 @@ public partial class VitalsChairApp
                         Log("- HOME             : Return to start");
                         Log("- LIVE             : Live monitoring mode");
                         Log("- STATUS           : Show current state");
+                        Log("- UART_TEST        : Send a test pattern on UART1 to check if the port is alive");
                         break;
 
                     default:
@@ -6471,6 +6476,29 @@ public partial class VitalsChairApp
 
 
 
+    static void RunUartTest()
+    {
+        // Distinctive pattern that won't be confused with any real protocol
+        // frame ID (0x04-0x24 range is all taken by real frames above).
+        byte[] testPattern = new byte[] { 0xAA, 0x55, 0xAA, 0x55, 0xDE, 0xAD, 0xBE, 0xEF };
+        try
+        {
+            _serialPortData.Write(testPattern, 0, testPattern.Length);
+            Log("[UART_TEST] Sent AA 55 AA 55 DE AD BE EF on /dev/verdin-uart1.");
+            Log("[UART_TEST] Jumper TX to RX on the connector BEFORE running this for a clean self-test: " +
+                "if the port itself is alive, the existing '[UART1] N bytes read ... first bytes: ...' log line " +
+                "will show that same AA 55 AA 55 DE AD BE EF sequence within the next couple seconds.");
+            Log("[UART_TEST] Without a jumper, a successful write here only proves the OS/driver side is working — " +
+                "it does NOT prove the TX pin is electrically producing a signal, and it won't produce any " +
+                "'[UART1] bytes read' response unless something out there echoes it back.");
+        }
+        catch (Exception ex)
+        {
+            Log($"[UART_TEST] Write failed: {ex.Message} — the OS-level write itself is failing here, which points " +
+                "to a driver/port-open problem rather than just a dead pin.");
+        }
+    }
+
     static void SendRequestPOST()
     {
         byte[] postRequestFrame = new byte[] { 0x40, 0xC0 };
@@ -6524,6 +6552,13 @@ public partial class VitalsChairApp
         //  Keep timeout, but we'll avoid hitting it
         // ReadTimeout = 100 is fine, we won't wait that long
 
+        // Diagnostic-only: proves whether ANY bytes ever arrive on UART1 at all,
+        // independent of frame parsing — SpO2/Temp/ECG (5-lead) all share this
+        // one physical port, so if this stays silent, none of them can work no
+        // matter what the parsing code does.
+        DateTime lastByteSeen = DateTime.MinValue;
+        long totalBytesSeen = 0;
+
         while (!cancellationToken.IsCancellationRequested)
         {
             try
@@ -6537,11 +6572,25 @@ public partial class VitalsChairApp
 
                     if (bytesRead > 0)
                     {
+                        lastByteSeen = DateTime.UtcNow;
+                        totalBytesSeen += bytesRead;
+                        string hexPreview = string.Join(" ", buffer.Take(Math.Min(bytesRead, 16)).Select(b => b.ToString("X2")));
+                        LogThrottled("uart1-raw", $"[UART1] {bytesRead} bytes read (total so far: {totalBytesSeen}) — first bytes: {hexPreview}", TimeSpan.FromSeconds(2));
+
                         await ProcessRawDataAsync(buffer, bytesRead, cancellationToken);
                     }
                 }
                 else
                 {
+                    if (lastByteSeen == DateTime.MinValue)
+                    {
+                        LogThrottled("uart1-silent-ever", "[UART1]  No bytes received on /dev/verdin-uart1 since startup — SpO2/Temp/ECG(5-lead)/NIBP all depend on this port", TimeSpan.FromSeconds(10));
+                    }
+                    else if ((DateTime.UtcNow - lastByteSeen) > TimeSpan.FromSeconds(5))
+                    {
+                        LogThrottled("uart1-silent-since", $"[UART1]  No bytes received in {(DateTime.UtcNow - lastByteSeen).TotalSeconds:F0}s (last seen at {lastByteSeen:HH:mm:ss.fff} UTC)", TimeSpan.FromSeconds(10));
+                    }
+
                     //  No data available - yield CPU for 1ms only
                     await Task.Delay(1, cancellationToken);
                 }
@@ -6702,7 +6751,14 @@ public partial class VitalsChairApp
             _ => "Unknown"
         };
 
-        Log($" ACK received for command 0x{commandId:X2}: {status}", LogLevel.Debug);
+        // Promoted to Info: this is the module directly telling us whether it
+        // received our last command intact. status != "OK" (especially
+        // "CHECKSUM error") means the command DID reach the sensor but arrived
+        // corrupted — evidence of a damaged/noisy TX line, not a dead one.
+        // No ACK at all ever appearing means the module either isn't hearing
+        // us, or isn't ACK'ing — evidence pointing the other way.
+        string ackMarker = ackStatus == 0 ? "" : " ⚠️";
+        Log($"[ACK] Command 0x{commandId:X2} → {status}{ackMarker}");
     }
 
 
@@ -6729,6 +6785,14 @@ public partial class VitalsChairApp
         byte actualChecksum = data[startIndex + 7];
         if (expectedChecksum != actualChecksum)
             throw new InvalidDataException("Checksum mismatch");
+
+        // Diagnostic: fires every time a 0x15 temperature frame passes checksum
+        // and is decoded — separate from the raw [UART1] byte log and from
+        // PrintTemperature/PrintLiveData, which are gated by state/live-mode.
+        LogThrottled("temp-frame-decode",
+            $"[TEMP] Frame decoded — raw temp1:{(temp1Raw == 0xFF9C ? "invalid" : (temp1Raw / 10.0f).ToString("F1"))} " +
+            $"raw temp2:{(temp2Raw == 0xFF9C ? "invalid" : (temp2Raw / 10.0f).ToString("F1"))} sensorStatus:0x{sensorStatus:X2}",
+            TimeSpan.FromSeconds(1));
 
         lock (_lock)
         {
@@ -6816,6 +6880,14 @@ public partial class VitalsChairApp
         // "PI %" (always showed 10-15%); it is now reported honestly as signal
         // quality 0-8 and the GUI labels it "Signal", not PI.
         float signalQuality = (signalStrength <= 8) ? signalStrength : 0.0f;
+
+        // Diagnostic: fires every time a 0x17 SpO2 frame is actually recognized
+        // and decoded, independent of PrintLiveData/_isLiveMode — proves frame
+        // parsing is happening at all, separate from the raw [UART1] byte log.
+        LogThrottled("spo2-frame-decode",
+            $"[SPO2] Frame decoded — raw SpO2:{spo2}% raw PR:{pulseRate}bpm signalStrength:{signalStrength}/8 " +
+            $"spo2Drop:{spo2Drop} searchTooLong:{searchTooLong}",
+            TimeSpan.FromSeconds(1));
 
         lock (_lock)
         {
