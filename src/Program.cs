@@ -2403,6 +2403,12 @@ public partial class VitalsChairApp
 
                 // ── Device Calibration request and Commands ──────────────────────────────────────────
 
+                else if (message.Contains("UART_TEST"))
+                {
+                    Log("[OTP Activity] UART_TEST requested over nav channel");
+                    RunUartTest();
+                }
+
                 else if (message.StartsWith("CALIBRATION|"))
                 {
                     string sensor = message.Split('|')[1].Trim().ToLower();
