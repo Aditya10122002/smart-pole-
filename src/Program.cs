@@ -370,6 +370,50 @@ public partial class VitalsChairApp
     private static int lastDia = 0;
     private static int lastMean = 0;
 
+    // -------------------------------------------------------------------------
+    // ESP32 RGB status controller
+    // Commands are handled by the dedicated ESP32-S3 RGB firmware:
+    //   0x10 = sensor failure  -> solid RED
+    //   0x11 = high            -> RED blink every 3 seconds
+    //   0x12 = slightly high   -> BLUE blink every 3 seconds
+    //   0x13 = normal          -> GREEN blink every 3 seconds
+    //
+    // The backend only sends a command when the overall state changes.
+    // The ESP32 performs the actual WS2812B timing and blinking.
+    // -------------------------------------------------------------------------
+    private const byte ESP_RGB_SENSOR_FAILURE = 0x10;
+    private const byte ESP_RGB_HIGH = 0x11;
+    private const byte ESP_RGB_SLIGHTLY_HIGH = 0x12;
+    private const byte ESP_RGB_NORMAL = 0x13;
+
+    private enum EspRgbStatus
+    {
+        SensorFailure,
+        High,
+        SlightlyHigh,
+        Normal
+    }
+
+    private static EspRgbStatus _espRgbLastStatus = EspRgbStatus.SensorFailure;
+    private static bool _espRgbFirstSend = true;
+
+    // These "slightly high" boundaries are deliberately kept here so they are
+    // easy to change later without touching the sensor processing code.
+    // Existing dashboard HIGH thresholds remain the upper boundary.
+    private const float TEMP_HIGH_THRESHOLD_C = 37.2f;
+    private const float TEMP_SLIGHT_HIGH_MAX_C = 38.0f;
+
+    private const int HR_HIGH_THRESHOLD = 100;
+    private const int HR_SLIGHT_HIGH_MAX = 110;
+
+    private const int BP_SYS_HIGH_THRESHOLD = 120;
+    private const int BP_DIA_HIGH_THRESHOLD = 80;
+    private const int BP_SYS_SLIGHT_HIGH_MAX = 130;
+    private const int BP_DIA_SLIGHT_HIGH_MAX = 85;
+
+
+    private static int _espRgbStatusSendCount = 0;
+
     private static int lastPulseWaveAmplitude = 0;
     private static float lastSignalQuality = 0;   // pleth signal strength 0-8 (module has no real PI)
 
@@ -1008,6 +1052,11 @@ public partial class VitalsChairApp
             var spiTask = Task.Run(() => ReadSpiDataAsync(cts.Token), cts.Token);
             var queueSyncTask = Task.Run(() => VitalsQueue.SyncWorkerAsync(cts.Token), cts.Token);
 
+            // Backend -> ESP32 RGB status task.
+            // The ESP32 owns the WS2812B timing/blinking; this task only sends
+            // a new status command when the overall sensor state changes.
+            var espRgbTask = Task.Run(() => EspRgbStatusLoopAsync(cts.Token), cts.Token);
+
             // Initialize hardware managers with configuration
             HardwareAudio.Initialize(Configuration);
 
@@ -1021,7 +1070,7 @@ public partial class VitalsChairApp
 
             // Start ethernet status monitor (detects and broadcasts ethernet connection state)
 
-            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask);
+            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask, espRgbTask);
 
             await Task.Run(() =>
             {
@@ -1042,7 +1091,7 @@ public partial class VitalsChairApp
                 }
             }, cts.Token);
 
-            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask);
+            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask, espRgbTask);
         }
         catch (Exception ex)
         {
@@ -1069,6 +1118,198 @@ public partial class VitalsChairApp
 
 
     /* ------------------------------------------------------------------------------------CONNECTIVITY UART, SPI, IIC -------------------------------------------------------------------*/
+
+    // =========================================================================
+    // ESP32 RGB STATUS
+    // =========================================================================
+
+    private static EspRgbStatus GetEspRgbStatus()
+    {
+        lock (_lock)
+        {
+            // -------------------------------------------------------------
+            // 1. SENSOR FAILURE HAS HIGHEST PRIORITY
+            // -------------------------------------------------------------
+            // SpO2 / pulse are considered disconnected/invalid when either
+            // live value is <= 0.
+            if (lastSpO2 <= 0 || lastPulseRate <= 0)
+                return EspRgbStatus.SensorFailure;
+
+            // Temperature sensors: NaN/<=0 means invalid/disconnected.
+            if (float.IsNaN(lastTemperature1) || lastTemperature1 <= 0 ||
+                float.IsNaN(lastTemperature2) || lastTemperature2 <= 0)
+            {
+                return EspRgbStatus.SensorFailure;
+            }
+
+            // BP is only evaluated when a NIBP measurement is active.
+            // Outside an active BP measurement, zero BP values are expected.
+            if (_isNIBPActive &&
+                (lastSys <= 0 || lastDia <= 0))
+            {
+                return EspRgbStatus.SensorFailure;
+            }
+
+            // -------------------------------------------------------------
+            // 2. HIGH
+            // -------------------------------------------------------------
+            // These upper thresholds match the current dashboard's
+            // documented HIGH boundaries for temperature, HR and BP.
+            if (lastTemperature1 > TEMP_HIGH_THRESHOLD_C ||
+                lastTemperature2 > TEMP_HIGH_THRESHOLD_C ||
+                lastPulseRate > HR_HIGH_THRESHOLD)
+            {
+                // We keep a higher band for "HIGH" and use the intermediate
+                // band below for "SLIGHTLY HIGH". See the slight-high check.
+                //
+                // If the value is only just above the normal range, it is
+                // classified as SlightlyHigh below.
+            }
+
+            if (IsAnyClearlyHighValue())
+                return EspRgbStatus.High;
+
+            // -------------------------------------------------------------
+            // 3. SLIGHTLY HIGH
+            // -------------------------------------------------------------
+            if (IsAnySlightlyHighValue())
+                return EspRgbStatus.SlightlyHigh;
+
+            // -------------------------------------------------------------
+            // 4. EVERYTHING NORMAL
+            // -------------------------------------------------------------
+            return EspRgbStatus.Normal;
+        }
+    }
+
+    private static bool IsAnyClearlyHighValue()
+    {
+        // Temperature: > 38.0 C is treated as clearly high.
+        if (lastTemperature1 > TEMP_SLIGHT_HIGH_MAX_C ||
+            lastTemperature2 > TEMP_SLIGHT_HIGH_MAX_C)
+        {
+            return true;
+        }
+
+        // Heart rate: > 110 BPM is clearly high.
+        if (lastPulseRate > HR_SLIGHT_HIGH_MAX)
+            return true;
+
+        // BP: >130 systolic or >85 diastolic is clearly high.
+        if (_isNIBPActive &&
+            (lastSys > BP_SYS_SLIGHT_HIGH_MAX ||
+             lastDia > BP_DIA_SLIGHT_HIGH_MAX))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsAnySlightlyHighValue()
+    {
+        // Temperature: current dashboard HIGH starts above 37.2 C.
+        // 37.3-38.0 C is treated as slightly high.
+        if ((lastTemperature1 > TEMP_HIGH_THRESHOLD_C &&
+             lastTemperature1 <= TEMP_SLIGHT_HIGH_MAX_C) ||
+            (lastTemperature2 > TEMP_HIGH_THRESHOLD_C &&
+             lastTemperature2 <= TEMP_SLIGHT_HIGH_MAX_C))
+        {
+            return true;
+        }
+
+        // HR: 101-110 BPM.
+        if (lastPulseRate > HR_HIGH_THRESHOLD &&
+            lastPulseRate <= HR_SLIGHT_HIGH_MAX)
+        {
+            return true;
+        }
+
+        // BP: 121-130 systolic or 81-85 diastolic.
+        if (_isNIBPActive &&
+            ((lastSys > BP_SYS_HIGH_THRESHOLD &&
+              lastSys <= BP_SYS_SLIGHT_HIGH_MAX) ||
+             (lastDia > BP_DIA_HIGH_THRESHOLD &&
+              lastDia <= BP_DIA_SLIGHT_HIGH_MAX)))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static byte EspRgbCommandForStatus(EspRgbStatus status)
+    {
+        return status switch
+        {
+            EspRgbStatus.SensorFailure => ESP_RGB_SENSOR_FAILURE,
+            EspRgbStatus.High => ESP_RGB_HIGH,
+            EspRgbStatus.SlightlyHigh => ESP_RGB_SLIGHTLY_HIGH,
+            EspRgbStatus.Normal => ESP_RGB_NORMAL,
+            _ => ESP_RGB_SENSOR_FAILURE
+        };
+    }
+
+    private static async Task EspRgbStatusLoopAsync(CancellationToken cancellationToken)
+    {
+        Log("[RGB] ESP32 RGB status controller started");
+
+        // Start in sensor-failure state until live sensors prove otherwise.
+        _espRgbLastStatus = EspRgbStatus.SensorFailure;
+        _espRgbFirstSend = true;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                EspRgbStatus status = GetEspRgbStatus();
+
+                if (_espRgbFirstSend || status != _espRgbLastStatus)
+                {
+                    byte command = EspRgbCommandForStatus(status);
+
+                    // Send through the same SPI manager already used by the
+                    // rest of the backend. No GPIO or WS2812B code is needed
+                    // on Linux; the ESP handles the LED.
+                    SpiManager.SendSpiCommand(command);
+
+                    _espRgbLastStatus = status;
+                    _espRgbFirstSend = false;
+                    _espRgbStatusSendCount++;
+
+                    Log(
+                        $"[RGB] ESP command 0x{command:X2} -> {status} " +
+                        $"(send #{_espRgbStatusSendCount})"
+                    );
+                }
+
+                // 250 ms is fast enough to react to sensor-state changes while
+                // avoiding repeated SPI transfers when nothing changed.
+                await Task.Delay(250, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log($"[RGB] Status controller error: {ex.Message}", LogLevel.Error);
+
+                // Do not kill the backend because the RGB ESP is temporarily
+                // unavailable. Retry on the next cycle.
+                try
+                {
+                    await Task.Delay(1000, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        Log("[RGB] ESP32 RGB status controller stopped");
+    }
 
     static void InitializeSerialPorts()
     {
