@@ -1252,40 +1252,38 @@ public partial class VitalsChairApp
 
     private static async Task EspRgbStatusLoopAsync(CancellationToken cancellationToken)
     {
-        Log("[RGB] ESP32 RGB status controller started");
+        Log("[RGB TEST] ESP32 RGB command test loop started");
 
-        // Start in sensor-failure state until live sensors prove otherwise.
-        _espRgbLastStatus = EspRgbStatus.SensorFailure;
-        _espRgbFirstSend = true;
+        // TEMPORARY TEST MODE:
+        // Send one RGB command every 60 seconds, independent of sensor values.
+        // Sequence: RED solid -> RED blink -> BLUE blink -> GREEN blink -> repeat.
+        // The ESP32 firmware is unchanged; only the master-side command timing
+        // is being tested here.
+        byte[] testCommands =
+        {
+            ESP_RGB_SENSOR_FAILURE, // 0x10 = RED solid
+            ESP_RGB_HIGH,           // 0x11 = RED blink
+            ESP_RGB_SLIGHTLY_HIGH,  // 0x12 = BLUE blink
+            ESP_RGB_NORMAL          // 0x13 = GREEN blink
+        };
+
+        int commandIndex = 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                EspRgbStatus status = GetEspRgbStatus();
+                byte command = testCommands[commandIndex];
 
-                if (_espRgbFirstSend || status != _espRgbLastStatus)
-                {
-                    byte command = EspRgbCommandForStatus(status);
+                // Send directly through the existing SPI master.
+                SpiManager.SendSpiCommand(command);
 
-                    // Send through the same SPI manager already used by the
-                    // rest of the backend. No GPIO or WS2812B code is needed
-                    // on Linux; the ESP handles the LED.
-                    SpiManager.SendSpiCommand(command);
+                Log($"[RGB TEST] Sent ESP command 0x{command:X2} " +
+                    $"({commandIndex + 1}/4) - next command in 60 seconds");
 
-                    _espRgbLastStatus = status;
-                    _espRgbFirstSend = false;
-                    _espRgbStatusSendCount++;
+                commandIndex = (commandIndex + 1) % testCommands.Length;
 
-                    Log(
-                        $"[RGB] ESP command 0x{command:X2} -> {status} " +
-                        $"(send #{_espRgbStatusSendCount})"
-                    );
-                }
-
-                // 250 ms is fast enough to react to sensor-state changes while
-                // avoiding repeated SPI transfers when nothing changed.
-                await Task.Delay(250, cancellationToken);
+                await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -1293,13 +1291,12 @@ public partial class VitalsChairApp
             }
             catch (Exception ex)
             {
-                Log($"[RGB] Status controller error: {ex.Message}", LogLevel.Error);
+                Log($"[RGB TEST] Command error: {ex.Message}", LogLevel.Error);
 
-                // Do not kill the backend because the RGB ESP is temporarily
-                // unavailable. Retry on the next cycle.
+                // Retry after one minute without stopping the backend.
                 try
                 {
-                    await Task.Delay(1000, cancellationToken);
+                    await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1308,7 +1305,7 @@ public partial class VitalsChairApp
             }
         }
 
-        Log("[RGB] ESP32 RGB status controller stopped");
+        Log("[RGB TEST] ESP32 RGB command test loop stopped");
     }
 
     static void InitializeSerialPorts()
