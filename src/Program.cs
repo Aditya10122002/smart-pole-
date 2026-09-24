@@ -386,6 +386,25 @@ public partial class VitalsChairApp
     private const byte ESP_RGB_SLIGHTLY_HIGH = 0x12;
     private const byte ESP_RGB_NORMAL = 0x13;
 
+    // Camera status commands are intentionally separate from RGB commands.
+    // 0x20 = camera is actively producing frames
+    // 0x21 = camera is unavailable / not producing frames
+    private const byte ESP_CAMERA_WORKING = 0x20;
+    private const byte ESP_CAMERA_FAILURE = 0x21;
+
+    private static readonly object _espCommandLock = new object();
+    private static bool _cameraLastWorking = false;
+    private static bool _cameraFirstSend = true;
+    private static int _cameraStatusSendCount = 0;
+
+    // Override with CAMERA_STATUS_URL when the camera service runs in another
+    // container. Example: http://camera:8001/status
+    private static readonly string CAMERA_STATUS_URL =
+        Environment.GetEnvironmentVariable("CAMERA_STATUS_URL")
+        ?? "http://127.0.0.1:8001/status";
+    private const int CAMERA_STATUS_INTERVAL_MS = 2000;
+    private const int CAMERA_STATUS_TIMEOUT_MS = 1500;
+
     private enum EspRgbStatus
     {
         SensorFailure,
@@ -1057,6 +1076,10 @@ public partial class VitalsChairApp
             // a new status command when the overall sensor state changes.
             var espRgbTask = Task.Run(() => EspRgbStatusLoopAsync(cts.Token), cts.Token);
 
+            // Backend -> ESP32 camera status task. This is independent from
+            // the vitals RGB task and only drives GPIO41/GPIO42 through the ESP.
+            var cameraStatusTask = Task.Run(() => CameraStatusLoopAsync(cts.Token), cts.Token);
+
             // Initialize hardware managers with configuration
             HardwareAudio.Initialize(Configuration);
 
@@ -1070,7 +1093,7 @@ public partial class VitalsChairApp
 
             // Start ethernet status monitor (detects and broadcasts ethernet connection state)
 
-            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask, espRgbTask);
+            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask, espRgbTask, cameraStatusTask);
 
             await Task.Run(() =>
             {
@@ -1091,7 +1114,7 @@ public partial class VitalsChairApp
                 }
             }, cts.Token);
 
-            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask, espRgbTask);
+            await Task.WhenAll(serverTask, heightTask, dataTask, deviceInfoTask, spiTask, queueSyncTask, espRgbTask, cameraStatusTask);
         }
         catch (Exception ex)
         {
@@ -1250,40 +1273,78 @@ public partial class VitalsChairApp
         };
     }
 
-    private static async Task EspRgbStatusLoopAsync(CancellationToken cancellationToken)
+    private static void SendEspCommand(byte command)
     {
-        Log("[RGB TEST] ESP32 RGB command test loop started");
-
-        // TEMPORARY TEST MODE:
-        // Send one RGB command every 60 seconds, independent of sensor values.
-        // Sequence: RED solid -> RED blink -> BLUE blink -> GREEN blink -> repeat.
-        // The ESP32 firmware is unchanged; only the master-side command timing
-        // is being tested here.
-        byte[] testCommands =
+        lock (_espCommandLock)
         {
-            ESP_RGB_SENSOR_FAILURE, // 0x10 = RED solid
-            ESP_RGB_HIGH,           // 0x11 = RED blink
-            ESP_RGB_SLIGHTLY_HIGH,  // 0x12 = BLUE blink
-            ESP_RGB_NORMAL          // 0x13 = GREEN blink
-        };
+            SpiManager.SendSpiCommand(command);
+        }
+    }
 
-        int commandIndex = 0;
+    private static async Task<bool> GetCameraWorkingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, CAMERA_STATUS_URL);
+            using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            requestCts.CancelAfter(CAMERA_STATUS_TIMEOUT_MS);
+
+            using HttpResponseMessage response = await _httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseContentRead,
+                requestCts.Token);
+
+            string body = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+                return false;
+
+            using JsonDocument document = JsonDocument.Parse(body);
+
+            return document.RootElement.TryGetProperty("connected", out JsonElement connected)
+                   && connected.ValueKind == JsonValueKind.True
+                   && connected.GetBoolean();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task CameraStatusLoopAsync(CancellationToken cancellationToken)
+    {
+        Log($"[CAMERA] Status controller started: {CAMERA_STATUS_URL}");
+
+        _cameraLastWorking = false;
+        _cameraFirstSend = true;
+
 
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                byte command = testCommands[commandIndex];
+                bool working = await GetCameraWorkingAsync(cancellationToken);
 
-                // Send directly through the existing SPI master.
-                SpiManager.SendSpiCommand(command);
+                if (_cameraFirstSend || working != _cameraLastWorking)
+                {
+                    byte command = working ? ESP_CAMERA_WORKING : ESP_CAMERA_FAILURE;
+                    SendEspCommand(command);
 
-                Log($"[RGB TEST] Sent ESP command 0x{command:X2} " +
-                    $"({commandIndex + 1}/4) - next command in 60 seconds");
+                    _cameraLastWorking = working;
+                    _cameraFirstSend = false;
+                    _cameraStatusSendCount++;
 
-                commandIndex = (commandIndex + 1) % testCommands.Length;
+                    Log(
+                        $"[CAMERA] ESP command 0x{command:X2} -> " +
+                        $"{(working ? "WORKING / GREEN" : "FAILURE / RED")} " +
+                        $"(send #{_cameraStatusSendCount})");
+                }
 
-                await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
+                await Task.Delay(CAMERA_STATUS_INTERVAL_MS, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -1291,12 +1352,11 @@ public partial class VitalsChairApp
             }
             catch (Exception ex)
             {
-                Log($"[RGB TEST] Command error: {ex.Message}", LogLevel.Error);
+                Log($"[CAMERA] Status controller error: {ex.Message}", LogLevel.Error);
 
-                // Retry after one minute without stopping the backend.
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
+                    await Task.Delay(CAMERA_STATUS_INTERVAL_MS, cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1305,7 +1365,68 @@ public partial class VitalsChairApp
             }
         }
 
-        Log("[RGB TEST] ESP32 RGB command test loop stopped");
+        Log("[CAMERA] Status controller stopped");
+    }
+
+    private static async Task EspRgbStatusLoopAsync(CancellationToken cancellationToken)
+    {
+        Log("[RGB] ESP32 RGB status controller started");
+
+        // Start in sensor-failure state until live sensors prove otherwise.
+        _espRgbLastStatus = EspRgbStatus.SensorFailure;
+        _espRgbFirstSend = true;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                EspRgbStatus status = GetEspRgbStatus();
+
+                if (_espRgbFirstSend || status != _espRgbLastStatus)
+                {
+                    byte command = EspRgbCommandForStatus(status);
+
+                    // Send through the same SPI manager already used by the
+                    // rest of the backend. No GPIO or WS2812B code is needed
+                    // on Linux; the ESP handles the LED.
+                    SendEspCommand(command);
+
+                    _espRgbLastStatus = status;
+                    _espRgbFirstSend = false;
+                    _espRgbStatusSendCount++;
+
+                    Log(
+                        $"[RGB] ESP command 0x{command:X2} -> {status} " +
+                        $"(send #{_espRgbStatusSendCount})"
+                    );
+                }
+
+                // 250 ms is fast enough to react to sensor-state changes while
+                // avoiding repeated SPI transfers when nothing changed.
+                await Task.Delay(250, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log($"[RGB] Status controller error: {ex.Message}", LogLevel.Error);
+
+                // Do not kill the backend because the RGB ESP is temporarily
+                // unavailable. Retry on the next cycle.
+                try
+                {
+                    await Task.Delay(1000, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        Log("[RGB] ESP32 RGB status controller stopped");
     }
 
     static void InitializeSerialPorts()
