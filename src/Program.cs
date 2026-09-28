@@ -373,10 +373,10 @@ public partial class VitalsChairApp
     // -------------------------------------------------------------------------
     // ESP32 RGB status controller
     // Commands are handled by the dedicated ESP32-S3 RGB firmware:
-    //   0x10 = sensor failure  -> solid RED
-    //   0x11 = high            -> RED blink every 3 seconds
-    //   0x12 = slightly high   -> BLUE blink every 3 seconds
-    //   0x13 = normal          -> GREEN blink every 3 seconds
+    //   0x10 = actual sensor fault -> solid RED
+    //   0x11 = valid patient measurement outside high limit -> RED blink
+    //   0x12 = valid patient measurement in slightly-high band -> BLUE blink
+    //   0x13 = idle/no patient OR valid normal measurement -> GREEN blink
     //
     // The backend only sends a command when the overall state changes.
     // The ESP32 performs the actual WS2812B timing and blinking.
@@ -415,6 +415,15 @@ public partial class VitalsChairApp
 
     private static EspRgbStatus _espRgbLastStatus = EspRgbStatus.SensorFailure;
     private static bool _espRgbFirstSend = true;
+
+    // Solid-red is reserved for an actual sensor fault.
+    // Missing patient contact / no finger / lead-off must NOT be treated as a fault.
+    private static bool _spo2SensorFailure = false;
+    private static bool _temperatureSensorFailure = false;
+
+    // Patient/contact state is separate from hardware-fault state.
+    // No finger/contact is a normal idle condition and must not create an alarm.
+    private static bool _spo2PatientContact = false;
 
     // These "slightly high" boundaries are deliberately kept here so they are
     // easy to change later without touching the sensor processing code.
@@ -1150,230 +1159,82 @@ public partial class VitalsChairApp
     {
         lock (_lock)
         {
-            // -------------------------------------------------------------
-            // 1. SENSOR FAILURE HAS HIGHEST PRIORITY
-            // -------------------------------------------------------------
-            // SpO2 / pulse are considered disconnected/invalid when either
-            // live value is <= 0.
-            if (lastSpO2 <= 0 || lastPulseRate <= 0)
+            // SOLID RED = actual sensor failure only.
+            // Do NOT use zero/NaN alone as failure: those states can simply mean
+            // no patient/finger contact or that the sensor is idle.
+            if (_spo2SensorFailure || _temperatureSensorFailure)
                 return EspRgbStatus.SensorFailure;
 
-            // Temperature sensors: NaN/<=0 means invalid/disconnected.
-            if (float.IsNaN(lastTemperature1) || lastTemperature1 <= 0 ||
-                float.IsNaN(lastTemperature2) || lastTemperature2 <= 0)
-            {
-                return EspRgbStatus.SensorFailure;
-            }
-
-            // BP is only evaluated when a NIBP measurement is active.
-            // Outside an active BP measurement, zero BP values are expected.
-            if (_isNIBPActive &&
-                (lastSys <= 0 || lastDia <= 0))
-            {
-                return EspRgbStatus.SensorFailure;
-            }
-
-            // -------------------------------------------------------------
-            // 2. HIGH
-            // -------------------------------------------------------------
-            // These upper thresholds match the current dashboard's
-            // documented HIGH boundaries for temperature, HR and BP.
-            if (lastTemperature1 > TEMP_HIGH_THRESHOLD_C ||
-                lastTemperature2 > TEMP_HIGH_THRESHOLD_C ||
-                lastPulseRate > HR_HIGH_THRESHOLD)
-            {
-                // We keep a higher band for "HIGH" and use the intermediate
-                // band below for "SLIGHTLY HIGH". See the slight-high check.
-                //
-                // If the value is only just above the normal range, it is
-                // classified as SlightlyHigh below.
-            }
-
+            // Normal physiological values never jump directly from GREEN to
+            // RED. They pass through SlightlyHigh (blue) first.
             if (IsAnyClearlyHighValue())
                 return EspRgbStatus.High;
 
-            // -------------------------------------------------------------
-            // 3. SLIGHTLY HIGH
-            // -------------------------------------------------------------
             if (IsAnySlightlyHighValue())
                 return EspRgbStatus.SlightlyHigh;
 
-            // -------------------------------------------------------------
-            // 4. EVERYTHING NORMAL
-            // -------------------------------------------------------------
             return EspRgbStatus.Normal;
         }
     }
 
+    private static bool IsTemperaturePatientPresent()
+    {
+        // The existing IR temperature stream is already used by the patient
+        // presence/capture logic: IR <= 0 means no warm patient/object.
+        return lastTemperatureIR > 0 && !float.IsNaN(lastTemperatureIR);
+    }
+
     private static bool IsAnyClearlyHighValue()
     {
-        // Temperature: > 38.0 C is treated as clearly high.
-        if (lastTemperature1 > TEMP_SLIGHT_HIGH_MAX_C ||
-            lastTemperature2 > TEMP_SLIGHT_HIGH_MAX_C)
-        {
-            return true;
-        }
-
-        // Heart rate: > 110 BPM is clearly high.
-        if (lastPulseRate > HR_SLIGHT_HIGH_MAX)
+        // Temperature is evaluated only when a patient/warm object is present.
+        if (IsTemperaturePatientPresent() &&
+            (lastTemperature1 > TEMP_SLIGHT_HIGH_MAX_C ||
+             lastTemperature2 > TEMP_SLIGHT_HIGH_MAX_C))
             return true;
 
-        // BP: >130 systolic or >85 diastolic is clearly high.
-        if (_isNIBPActive &&
-            (lastSys > BP_SYS_SLIGHT_HIGH_MAX ||
-             lastDia > BP_DIA_SLIGHT_HIGH_MAX))
-        {
+        // SpO2 pulse rate is evaluated only while a valid finger/contact exists.
+        if (_spo2PatientContact && lastPulseRate > HR_SLIGHT_HIGH_MAX)
             return true;
-        }
 
+        // SpO2 is evaluated only while a valid finger/contact exists.
+        if (_spo2PatientContact && lastSpO2 > 0 && lastSpO2 < 85)
+            return true;
+
+        // BP is intentionally NOT part of RGB status. It is a one-time measurement.
         return false;
     }
 
     private static bool IsAnySlightlyHighValue()
     {
-        // Temperature: current dashboard HIGH starts above 37.2 C.
-        // 37.3-38.0 C is treated as slightly high.
-        if ((lastTemperature1 > TEMP_HIGH_THRESHOLD_C &&
-             lastTemperature1 <= TEMP_SLIGHT_HIGH_MAX_C) ||
-            (lastTemperature2 > TEMP_HIGH_THRESHOLD_C &&
-             lastTemperature2 <= TEMP_SLIGHT_HIGH_MAX_C))
-        {
+        // Temperature: 37.3-38.0 C = blue blink, only with patient presence.
+        if (IsTemperaturePatientPresent() &&
+            ((lastTemperature1 > TEMP_HIGH_THRESHOLD_C &&
+              lastTemperature1 <= TEMP_SLIGHT_HIGH_MAX_C) ||
+             (lastTemperature2 > TEMP_HIGH_THRESHOLD_C &&
+              lastTemperature2 <= TEMP_SLIGHT_HIGH_MAX_C)))
             return true;
-        }
 
-        // HR: 101-110 BPM.
-        if (lastPulseRate > HR_HIGH_THRESHOLD &&
+        // Heart rate: 101-110 BPM, only with valid SpO2 contact.
+        if (_spo2PatientContact &&
+            lastPulseRate > HR_HIGH_THRESHOLD &&
             lastPulseRate <= HR_SLIGHT_HIGH_MAX)
-        {
             return true;
-        }
 
-        // BP: 121-130 systolic or 81-85 diastolic.
-        if (_isNIBPActive &&
-            ((lastSys > BP_SYS_HIGH_THRESHOLD &&
-              lastSys <= BP_SYS_SLIGHT_HIGH_MAX) ||
-             (lastDia > BP_DIA_HIGH_THRESHOLD &&
-              lastDia <= BP_DIA_SLIGHT_HIGH_MAX)))
-        {
+        // SpO2: 85-90% = blue blink. >90% remains green.
+        if (_spo2PatientContact && lastSpO2 >= 85 && lastSpO2 <= 90)
             return true;
-        }
 
+        // BP is intentionally NOT part of RGB status.
         return false;
-    }
-
-    private static byte EspRgbCommandForStatus(EspRgbStatus status)
-    {
-        return status switch
-        {
-            EspRgbStatus.SensorFailure => ESP_RGB_SENSOR_FAILURE,
-            EspRgbStatus.High => ESP_RGB_HIGH,
-            EspRgbStatus.SlightlyHigh => ESP_RGB_SLIGHTLY_HIGH,
-            EspRgbStatus.Normal => ESP_RGB_NORMAL,
-            _ => ESP_RGB_SENSOR_FAILURE
-        };
-    }
-
-    private static void SendEspCommand(byte command)
-    {
-        lock (_espCommandLock)
-        {
-            SpiManager.SendSpiCommand(command);
-        }
-    }
-
-    private static async Task<bool> GetCameraWorkingAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Get, CAMERA_STATUS_URL);
-            using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            requestCts.CancelAfter(CAMERA_STATUS_TIMEOUT_MS);
-
-            using HttpResponseMessage response = await _httpClient.SendAsync(
-                request,
-                HttpCompletionOption.ResponseContentRead,
-                requestCts.Token);
-
-            string body = await response.Content.ReadAsStringAsync(cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-                return false;
-
-            using JsonDocument document = JsonDocument.Parse(body);
-
-            return document.RootElement.TryGetProperty("connected", out JsonElement connected)
-                   && connected.ValueKind == JsonValueKind.True
-                   && connected.GetBoolean();
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static async Task CameraStatusLoopAsync(CancellationToken cancellationToken)
-    {
-        Log($"[CAMERA] Status controller started: {CAMERA_STATUS_URL}");
-
-        _cameraLastWorking = false;
-        _cameraFirstSend = true;
-
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                bool working = await GetCameraWorkingAsync(cancellationToken);
-
-                if (_cameraFirstSend || working != _cameraLastWorking)
-                {
-                    byte command = working ? ESP_CAMERA_WORKING : ESP_CAMERA_FAILURE;
-                    SendEspCommand(command);
-
-                    _cameraLastWorking = working;
-                    _cameraFirstSend = false;
-                    _cameraStatusSendCount++;
-
-                    Log(
-                        $"[CAMERA] ESP command 0x{command:X2} -> " +
-                        $"{(working ? "WORKING / GREEN" : "FAILURE / RED")} " +
-                        $"(send #{_cameraStatusSendCount})");
-                }
-
-                await Task.Delay(CAMERA_STATUS_INTERVAL_MS, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Log($"[CAMERA] Status controller error: {ex.Message}", LogLevel.Error);
-
-                try
-                {
-                    await Task.Delay(CAMERA_STATUS_INTERVAL_MS, cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
-        }
-
-        Log("[CAMERA] Status controller stopped");
     }
 
     private static async Task EspRgbStatusLoopAsync(CancellationToken cancellationToken)
     {
         Log("[RGB] ESP32 RGB status controller started");
 
-        // Start in sensor-failure state until live sensors prove otherwise.
-        _espRgbLastStatus = EspRgbStatus.SensorFailure;
+        // Start in NORMAL/idle state. Solid red is reserved for an actual
+        // fault reported by a sensor; startup/no-patient is not a fault.
+        _espRgbLastStatus = EspRgbStatus.Normal;
         _espRgbFirstSend = true;
 
         while (!cancellationToken.IsCancellationRequested)
@@ -7163,8 +7024,17 @@ public partial class VitalsChairApp
 
         lock (_lock)
         {
-            lastTemperature1 = (sensorStatus & 0x01) != 0 || temp1Raw == 0xFF9C ? float.NaN : temp1Raw / 10.0f;
-            lastTemperature2 = (sensorStatus & 0x02) != 0 || temp2Raw == 0xFF9C ? float.NaN : temp2Raw / 10.0f;
+            // Explicit sensor-status bits are the hardware-fault indication.
+            // The 0xFF9C invalid value by itself can also occur when the sensor
+            // has no usable patient contact, so it must not create solid red.
+            bool temp1Fault = (sensorStatus & 0x01) != 0;
+            bool temp2Fault = (sensorStatus & 0x02) != 0;
+            _temperatureSensorFailure = temp1Fault || temp2Fault;
+
+            lastTemperature1 = (temp1Fault || temp1Raw == 0xFF9C)
+                ? float.NaN : temp1Raw / 10.0f;
+            lastTemperature2 = (temp2Fault || temp2Raw == 0xFF9C)
+                ? float.NaN : temp2Raw / 10.0f;
 
             if (_currentState == MeasurementState.TEMPERATURE)
             {
@@ -7241,6 +7111,13 @@ public partial class VitalsChairApp
         pulseRate = (pulseRate < 40 || pulseRate > 250) ? 0 : pulseRate;
         spo2 = (spo2 < 60 || spo2 > 100) ? 0 : spo2;
 
+        // IMPORTANT: sensor connection/contact and hardware failure are separate.
+        // 0 = no finger/contact -> normal idle condition, NO alarm.
+        // 1-8 = usable signal-strength range. Invalid/unstable values while the
+        // finger is being positioned are NOT enough to declare hardware failure.
+        // 15 = the module's explicit invalid/fault indication -> real fault.
+        _spo2SensorFailure = (signalStrength == 15);
+
         // Signal quality straight from the module (0-8; 15 = invalid).
         // The UN806C does NOT provide a Perfusion Index — protocol §1.3.15 bits 3:0
         // are a pleth signal-strength indicator. We previously scaled this to a fake
@@ -7264,6 +7141,10 @@ public partial class VitalsChairApp
 
             bool fingerPresent = signalStrength > 0 && signalStrength <= 8
                                  && lastSpO2 > 0 && lastPulseRate > 0;
+
+            // This is patient/contact state, not sensor-fault state.
+            // Removing the finger immediately disables SpO2/HR alarm evaluation.
+            _spo2PatientContact = fingerPresent;
 
             RunSpo2StateMachine(fingerPresent);
 
