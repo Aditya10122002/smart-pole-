@@ -965,6 +965,374 @@ public partial class VitalsChairApp
         return float.TryParse(s, NumberStyles.Float | NumberStyles.AllowLeadingSign,
                              CultureInfo.InvariantCulture, out value);
     }
+
+    // ========================================================================
+    // HEMODIALYSIS TCP SERVER
+    // Uses the existing SpiManager.HealthData packet only.
+    // No second SPI struct/protocol is introduced.
+    // ========================================================================
+    private const int HemoPort = 5045;
+    private const int HemoPlannedSeconds = 4 * 60 * 60;
+
+    private static readonly object _hemoLock = new object();
+    private static readonly List<NetworkStream> _hemoClients = new List<NetworkStream>();
+    private static readonly List<(double t, double weight, double removed)> _hemoWeightHistory =
+        new List<(double t, double weight, double removed)>();
+    private static readonly List<(double t, double tbw, double ecw, double icw)> _hemoBiaHistory =
+        new List<(double t, double tbw, double ecw, double icw)>();
+
+    private static SpiManager.HealthData _hemoLatestHealthData;
+    private static bool _hemoHasHealthData = false;
+    private static int _hemoHeightCm = 0;
+    private static double _hemoTargetKg = 0;
+    private static double _hemoPreKg = 0;
+    private static DateTime _hemoStartUtc = DateTime.MinValue;
+    private static bool _hemoActive = false;
+    private static string _hemoLastBiaStamp = "";
+
+    private static void UpdateHemodialysisFromHealthData(SpiManager.HealthData data)
+    {
+        lock (_hemoLock)
+        {
+            _hemoLatestHealthData = data;
+            _hemoHasHealthData = true;
+
+            if (data.Height > 0)
+                _hemoHeightCm = (int)Math.Round(data.Height);
+
+            if (_hemoActive && _hemoPreKg <= 0 && data.Weight > 0)
+                _hemoPreKg = data.Weight;
+
+            if (_hemoActive && data.Weight > 0)
+            {
+                double t = Math.Max(0, (DateTime.UtcNow - _hemoStartUtc).TotalSeconds);
+                double removed = Math.Max(0, _hemoPreKg - data.Weight);
+
+                if (_hemoWeightHistory.Count == 0 ||
+                    t > _hemoWeightHistory[_hemoWeightHistory.Count - 1].t)
+                {
+                    _hemoWeightHistory.Add((t, data.Weight, removed));
+                    if (_hemoWeightHistory.Count > 2000)
+                        _hemoWeightHistory.RemoveAt(0);
+                }
+
+                string biaStamp = string.Join("|",
+                    data.BodyWater.ToString("F2", CultureInfo.InvariantCulture),
+                    data.ExtracellularWater.ToString("F2", CultureInfo.InvariantCulture),
+                    data.IntracellularWater.ToString("F2", CultureInfo.InvariantCulture),
+                    data.FatMass.ToString("F2", CultureInfo.InvariantCulture));
+
+                if (!string.Equals(biaStamp, _hemoLastBiaStamp, StringComparison.Ordinal))
+                {
+                    _hemoLastBiaStamp = biaStamp;
+                    double tbw = data.BodyWater;
+                    double ecw = data.ExtracellularWater;
+                    double icw = data.IntracellularWater;
+
+                    if (tbw > 0 || ecw > 0 || icw > 0)
+                    {
+                        _hemoBiaHistory.Add((t, tbw, ecw, icw));
+                        if (_hemoBiaHistory.Count > 500)
+                            _hemoBiaHistory.RemoveAt(0);
+                    }
+                }
+            }
+        }
+    }
+
+    private static async Task StartHemodialysisTcpServerAsync()
+    {
+        try
+        {
+            var listener = new TcpListener(IPAddress.Any, HemoPort);
+            listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            listener.Start();
+
+            Log($"[HEMO] TCP Server started on 0.0.0.0:{HemoPort}");
+
+            _ = Task.Run(HemodialysisLiveBroadcastLoopAsync);
+
+            while (true)
+            {
+                TcpClient client = await listener.AcceptTcpClientAsync();
+                Log($"[HEMO] Client connected: {client.Client.RemoteEndPoint}");
+                _ = Task.Run(() => HandleHemodialysisClientAsync(client));
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"[HEMO] TCP Server error: {ex.Message}");
+        }
+    }
+
+    private static async Task HandleHemodialysisClientAsync(TcpClient client)
+    {
+        NetworkStream stream = client.GetStream();
+
+        lock (_hemoLock)
+        {
+            _hemoClients.Add(stream);
+        }
+
+        try
+        {
+            byte[] buffer = new byte[4096];
+            string request = "";
+
+            int n = await stream.ReadAsync(buffer, 0, buffer.Length);
+            if (n <= 0) return;
+
+            request = Encoding.UTF8.GetString(buffer, 0, n).Trim();
+
+            if (!string.Equals(request, "hemodialysis", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            await HemoSendAsync(stream, "HEMO_READY");
+
+            lock (_hemoLock)
+            {
+                _hemoActive = false;
+                _hemoPreKg = 0;
+                _hemoStartUtc = DateTime.MinValue;
+                _hemoWeightHistory.Clear();
+                _hemoBiaHistory.Clear();
+                _hemoLastBiaStamp = "";
+            }
+
+            await HemoSendAsync(stream, BuildHemoHistoryJson());
+
+            while (client.Connected)
+            {
+                n = await stream.ReadAsync(buffer, 0, buffer.Length);
+                if (n <= 0) break;
+
+                string text = Encoding.UTF8.GetString(buffer, 0, n);
+
+                foreach (string raw in text.Split('\n'))
+                {
+                    string message = raw.Trim();
+                    if (string.IsNullOrEmpty(message)) continue;
+
+                    if (message.StartsWith("SET_HEIGHT:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(message.Substring("SET_HEIGHT:".Length).Trim(), out int cm) &&
+                            cm >= 100 && cm <= 250)
+                        {
+                            lock (_hemoLock) _hemoHeightCm = cm;
+
+                            SpiManager.SendHemoHeightCommand(cm);
+                            await HemoSendAsync(stream, $"HEIGHT_OK:{cm}");
+                        }
+                        else
+                        {
+                            await HemoSendAsync(stream, "HEIGHT_ERROR:Invalid height");
+                        }
+                    }
+                    else if (message.StartsWith("SET_TARGET:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (double.TryParse(message.Substring("SET_TARGET:".Length).Trim(),
+                            NumberStyles.Float, CultureInfo.InvariantCulture, out double kg) &&
+                            kg >= 20 && kg <= 250)
+                        {
+                            lock (_hemoLock)
+                            {
+                                _hemoTargetKg = kg;
+
+                                if (_hemoHasHealthData && _hemoLatestHealthData.Weight > 0)
+                                    _hemoPreKg = _hemoLatestHealthData.Weight;
+
+                                _hemoStartUtc = DateTime.UtcNow;
+                                _hemoActive = true;
+                                _hemoWeightHistory.Clear();
+                                _hemoBiaHistory.Clear();
+                                _hemoLastBiaStamp = "";
+                            }
+
+                            SpiManager.SendHemoTargetCommand((float)kg);
+                            SpiManager.SendHemoCommand(SpiManager.CMD_HEMO_START);
+
+                            await HemoSendAsync(stream, $"TARGET_OK:{kg.ToString("F1", CultureInfo.InvariantCulture)}");
+                        }
+                        else
+                        {
+                            await HemoSendAsync(stream, "TARGET_ERROR:Invalid target weight");
+                        }
+                    }
+                    else if (string.Equals(message, "REMEASURE_BIA", StringComparison.OrdinalIgnoreCase))
+                    {
+                        SpiManager.SendHemoCommand(SpiManager.CMD_HEMO_REMEASURE_BIA);
+                        await HemoSendAsync(stream, "BIA_OK");
+                    }
+                    else if (string.Equals(message, "STOP", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(message, "STOP_SESSION", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lock (_hemoLock) _hemoActive = false;
+                        SpiManager.SendHemoCommand(SpiManager.CMD_HEMO_STOP);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"[HEMO] Client error: {ex.Message}");
+        }
+        finally
+        {
+            lock (_hemoLock)
+            {
+                _hemoClients.Remove(stream);
+            }
+
+            try { client.Close(); } catch { }
+            Log("[HEMO] Client disconnected");
+        }
+    }
+
+    private static async Task HemodialysisLiveBroadcastLoopAsync()
+    {
+        while (true)
+        {
+            try
+            {
+                string json;
+                lock (_hemoLock)
+                {
+                    json = BuildHemoLiveJson();
+                }
+
+                List<NetworkStream> clients;
+                lock (_hemoLock)
+                    clients = new List<NetworkStream>(_hemoClients);
+
+                foreach (NetworkStream stream in clients)
+                {
+                    try
+                    {
+                        await HemoSendAsync(stream, "HEMO_SENSOR_CONNECTED");
+                        await HemoSendAsync(stream, "LIVE:" + json);
+                    }
+                    catch
+                    {
+                        lock (_hemoLock)
+                            _hemoClients.Remove(stream);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[HEMO] Live broadcast error: {ex.Message}");
+            }
+
+            await Task.Delay(1000);
+        }
+    }
+
+    private static async Task HemoSendAsync(NetworkStream stream, string line)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(line + "\n");
+        await stream.WriteAsync(bytes, 0, bytes.Length);
+        await stream.FlushAsync();
+    }
+
+    private static string BuildHemoHistoryJson()
+    {
+        lock (_hemoLock)
+        {
+            var weight = new List<List<double>>();
+            var removed = new List<List<double>>();
+            foreach (var p in _hemoWeightHistory)
+            {
+                weight.Add(new List<double> { p.t, p.weight });
+                removed.Add(new List<double> { p.t, p.removed });
+            }
+
+            var bia = new List<List<double>>();
+            foreach (var p in _hemoBiaHistory)
+                bia.Add(new List<double> { p.t, p.tbw, p.ecw, p.icw });
+
+            return JsonSerializer.Serialize(new { weight, removed, bia });
+        }
+    }
+
+    private static string BuildHemoLiveJson()
+    {
+        SpiManager.HealthData d = _hemoLatestHealthData;
+
+        double weight = d.Weight > 0 ? d.Weight : 0;
+        double pre = _hemoPreKg > 0 ? _hemoPreKg : weight;
+        double target = _hemoTargetKg;
+
+        double removed = Math.Max(0, pre - weight);
+        double targetRemoval = target > 0 ? Math.Max(0, pre - target) : 0;
+        double remaining = Math.Max(0, targetRemoval - removed);
+
+        int tSec = _hemoActive && _hemoStartUtc != DateTime.MinValue
+            ? (int)Math.Max(0, (DateTime.UtcNow - _hemoStartUtc).TotalSeconds)
+            : 0;
+
+        int progress = targetRemoval > 0
+            ? (int)Math.Round(Math.Clamp((removed / targetRemoval) * 100.0, 0, 100))
+            : 0;
+
+        double ufRate = tSec > 0 ? removed * 1000.0 / (tSec / 3600.0) : 0;
+        double ufRateKg = pre > 0 ? ufRate / pre : 0;
+
+        double tbw = d.BodyWater;
+        double ecw = d.ExtracellularWater;
+        double icw = d.IntracellularWater;
+        double tbwPct = weight > 0 ? tbw * 100.0 / weight : 0;
+        double ecwPct = weight > 0 ? ecw * 100.0 / weight : 0;
+        double icwPct = weight > 0 ? icw * 100.0 / weight : 0;
+
+        string measuredAt = (tbw > 0 || ecw > 0 || icw > 0)
+            ? DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
+            : "";
+
+        var bia = new
+        {
+            tbwL = tbw,
+            tbwPct,
+            ecwL = ecw,
+            ecwPct,
+            icwL = icw,
+            icwPct,
+            leanKg = d.LeanBodyMass,
+            fatKg = d.FatMass,
+            fatPct = d.BodyFatPercent,
+            measuredAt,
+            leanFatSource = (d.LeanBodyMass > 0 || d.FatMass > 0) ? "measured" : "estimated"
+        };
+
+        return JsonSerializer.Serialize(new
+        {
+            patientName = "",
+            patientId = "",
+            bed = "",
+            ageSex = "",
+            sessionType = "Hemodialysis",
+            tSec,
+            plannedSec = HemoPlannedSeconds,
+            remainingSec = Math.Max(0, HemoPlannedSeconds - tSec),
+            status = _hemoActive ? "RUNNING" : "IDLE",
+            statusDetail = _hemoActive ? "Live monitoring" : "Waiting for target weight",
+            statusLevel = "ok",
+            weightKg = weight,
+            preKg = pre,
+            targetKg = target,
+            changeKg = weight - pre,
+            targetRemovalL = targetRemoval,
+            removedL = removed,
+            remainingL = remaining,
+            progressPct = progress,
+            ufRateMlH = ufRate,
+            ufRateMlKgH = ufRateKg,
+            heightCm = _hemoHeightCm > 0 ? _hemoHeightCm : (int)Math.Round(d.Height),
+            bia,
+            biaPre = (object?)null,
+            biaChange = (object?)null
+        });
+    }
+
     static async Task StartAllServersAsync()
     {
         var tasks = new List<Task>
@@ -982,6 +1350,7 @@ public partial class VitalsChairApp
             StartAnalysisTcpServerAsync(),
             HardwareWifi.StartWifiTcpServerAsync(),
             StartVoiceTcpServerAsync(),
+            StartHemodialysisTcpServerAsync(),
 
 
 
@@ -1513,6 +1882,7 @@ public partial class VitalsChairApp
 
                     // ── Body composition + height/weight ──
                     UpdateBodyCompositionData(data);
+                    UpdateHemodialysisFromHealthData(healthData);
 
                     // ── Range data ──
                     if (!_hasRangeData

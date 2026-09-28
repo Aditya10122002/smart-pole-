@@ -22,6 +22,16 @@ internal static class SpiManager
     public const byte CMD_WEIGHT_CALIBRATE = 0x05;
     public const byte CMD_HEIGHT_CALIBRATE = 0x06;
     public const byte CMD_TEMPERATURE_CALIBRATE = 0x07;
+
+    // Hemodialysis commands - existing HealthData struct remains unchanged.
+    public const byte CMD_HEMO_START = 0x30;
+    public const byte CMD_HEMO_STOP = 0x31;
+    public const byte CMD_HEMO_SET_HEIGHT = 0x32;
+    public const byte CMD_HEMO_SET_TARGET = 0x33;
+    public const byte CMD_HEMO_REMEASURE_BIA = 0x34;
+
+    private static readonly object _spiTransferLock = new object();
+
     public const uint MAGIC_HEADER = 0xDEADBEEF;
     public const uint MAGIC_HEADER_RANGE = 0xABCD1234;
 
@@ -113,10 +123,13 @@ internal static class SpiManager
                 Marshal.FreeHGlobal(ptr);
             }
 
-            for (int i = 0; i < 3; i++)
+            lock (_spiTransferLock)
             {
-                _spiDevice.TransferFullDuplex(txData, rxData);
-                Thread.Sleep(50);
+                for (int i = 0; i < 3; i++)
+                {
+                    _spiDevice.TransferFullDuplex(txData, rxData);
+                    Thread.Sleep(50);
+                }
             }
 
             string cmdName = command switch
@@ -169,6 +182,82 @@ internal static class SpiManager
         Log($"✅ [SPI RELIABLE] Completed {cmdName}");
     }
 
+
+    // Hemo commands reuse the existing HealthData payload fields.
+    public static void SendHemoHeightCommand(float heightCm)
+    {
+        SendHemoPayloadCommand(CMD_HEMO_SET_HEIGHT, heightCm, 0f);
+    }
+
+    public static void SendHemoTargetCommand(float targetKg)
+    {
+        SendHemoPayloadCommand(CMD_HEMO_SET_TARGET, 0f, targetKg);
+    }
+
+    public static void SendHemoCommand(byte command)
+    {
+        SendHemoPayloadCommand(command, 0f, 0f);
+    }
+
+    private static void SendHemoPayloadCommand(byte command, float heightCm, float targetKg)
+    {
+        try
+        {
+            if (_spiDevice == null)
+            {
+                Log("⚠️ SPI device not initialized");
+                return;
+            }
+
+            byte actualAge = _hasPatientData ? _currentUserAge : (byte)25;
+            byte actualGender = _hasPatientData ? _currentUserGender : (byte)1;
+
+            HealthData commandData = new()
+            {
+                Magic = MAGIC_HEADER,
+                Height = heightCm,
+                Weight = targetKg,
+                CommandFromMaster = command,
+                UserAge = actualAge,
+                UserGender = actualGender,
+                Reserved = 0,
+                BodyType = new byte[16]
+            };
+
+            commandData.Checksum = CalculateChecksum(commandData);
+
+            int structSize = Marshal.SizeOf<HealthData>();
+            byte[] txData = new byte[SpiBufferSize];
+            byte[] rxData = new byte[SpiBufferSize];
+
+            IntPtr ptr = Marshal.AllocHGlobal(structSize);
+            try
+            {
+                Marshal.StructureToPtr(commandData, ptr, false);
+                Marshal.Copy(ptr, txData, 0, structSize);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(ptr);
+            }
+
+            lock (_spiTransferLock)
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    _spiDevice.TransferFullDuplex(txData, rxData);
+                    Thread.Sleep(50);
+                }
+            }
+
+            Log($"✅ HEMO SPI command 0x{command:X2}");
+        }
+        catch (Exception ex)
+        {
+            Log($"❌ HEMO SPI error: {ex.Message}");
+        }
+    }
+
     public static byte[]? RequestSpiHealthData()
     {
         try
@@ -181,7 +270,12 @@ internal static class SpiManager
 
             byte[] txData = new byte[SpiBufferSize];
             byte[] rxData = new byte[SpiBufferSize];
-            _spiDevice.TransferFullDuplex(txData, rxData);
+
+            lock (_spiTransferLock)
+            {
+                _spiDevice.TransferFullDuplex(txData, rxData);
+            }
+
             return rxData;
         }
         catch (Exception ex)
